@@ -1,0 +1,298 @@
+---
+title: "Practical Machine Learning course project - predicting sporting activity"
+author: "S. Klayn"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+### Outline   
+Devices such as Jawbone Up, Nike FuelBand, and Fitbit collect large amounts of data about personal health and activity, but people rarely try to quantify how well they do a particular activity.  
+This project's goal is to predict how well the participants in a study performed barbell lifts, based on use data from accelerometers on their belt, forearm, arm, and the dumbell. The 6 participants in the study performed barbell lifts correctly and incorrectly in 5 different ways.  
+The data are provided by Velloso et al., 2013, and are available [here](http://groupware.les.inf.puc-rio.br/har), together with more information on the project (Weight Lifting Exercise Dataset).  
+
+#### Dataset citation     
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.   
+
+### Setup  
+Set up the workspace (root and subdirectory structure) and load packages.  
+```{r setup, include=FALSE}
+## set the project working directory
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file()) 
+
+## hide code from main text 
+knitr::opts_chunk$set(echo = FALSE, tidy = TRUE, tidy.opts = list(width.cutoff = 60))
+```
+
+
+```{r workspace_setup}
+## define the data and output subdirectories
+data.dir <- "data"
+save.dir <- "output"
+```
+
+```{r load_packages, message=FALSE}
+library(tidyverse) ## data cleaning, manipulation and transformation 
+library(here) ## easy relative paths to files and directories
+library(caret) ## preprocessing, feature selection, model fitting, parameter tuning etc for creating predictive models
+```
+
+```{r set_ggplot_theme}
+## set the ggplot theme to always black-and-white.  
+theme_set(theme_bw())
+```
+
+
+### Data import and cleaning   
+Download and read in the training and test datasets.  
+```{r download_data}
+train.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+## download to data folder (could be read directly, too - but I like to have a local copy)
+download.file(train.url, 
+              destfile = here(data.dir, "pml-training.csv"))
+download.file(test.url, 
+              destfile = here(data.dir, "pml-testing.csv"))
+```
+
+#### Training dataset  
+Some of the columns in the training data have "#DIV/0!" which messes up the type detection - I'll set this string as NA on import.   
+```{r load_training_data}
+train.data <- read_csv(here(data.dir, "pml-training.csv"), na = c("NA", "#DIV/0!")) 
+```
+
+The dependent variable (how the exercise was performed) is "classe" - A means it was performed correctly, while the others (B-E) are different types of mistakes.  
+The other variables are 1) user names, dates and similar 2) movement data - various accelerations, angles, and derived variances and distributions of these for each sensor - not really documented for this particular dataset beyond the basic description.   
+
+```{r check_training_data}
+## check the training dataset's structure 
+glimpse(train.data)
+```
+
+Some columns are automatically recognized as "logical" class - that's usually because they're all-NA. They were dropped after checking that they were indeed all NAs, because they wouldn't be of much value for this project.   
+```{r check_logical_vars_training}
+train.data %>% 
+    select_if(is.logical) %>% 
+    summary
+```
+
+
+```{r drop_all_na_vars_training}
+train.data.clean <- train.data %>% 
+    janitor::remove_empty(which = "cols")
+```
+
+
+The timestamps and similar variables were also dropped, but the user names were kept, in case the way the exercises were performed differed sufficiently between users to be worth exploring.   
+The dependent variable was converted to factor (it was initially character).  
+```{r clean_training_drop_irrelevant_vars} 
+train.data.clean <- train.data.clean %>% 
+    select(!c(raw_timestamp_part_1:num_window)) %>% 
+    mutate(classe = factor(classe))
+```
+
+
+Variables consisting of >50% NAs were also dropped instead of trying to impute the missing values, because that would have probably introduced too much extra noise.  
+```{r drop_50_perc_na_vars_training}
+## count the number of NAs in each predictor variable, then calculate the proportion  
+(na.analysis.train <- train.data.clean %>% 
+     select(-c(X1, user_name, classe)) %>% 
+     summarise_all(~sum(is.na(.x))) %>% 
+     pivot_longer(cols = everything(), names_to = "variable", values_to = "na_count") %>% 
+     mutate(prop_na = na_count / nrow(train.data.clean))
+)
+
+## get the names of the variables with > 50% missing values
+na.to.drop <- na.analysis.train %>% 
+    filter(prop_na > 0.5) %>% 
+    pull(variable)
+
+
+## drop them from the training data 
+train.data.clean <- train.data.clean %>% 
+    select(-all_of(na.to.drop))
+```
+
+This left about 52 variables to use for predicting.  
+
+
+
+#### Testing dataset   
+```{r load_testing_data}
+test.data <- read_csv(here(data.dir, "pml-testing.csv"))
+```
+
+```{r check_testing_data}
+## check the testing dataset's structure
+glimpse(test.data)
+```
+
+The testing dataset contains a lot of all-NA variables, but after dropping the >50% NA-columns already dropped from the training dataset, this problem is solved.   
+```{r check_final_vars_train_test}
+## check if the all-NA variables are dropped when I excluded the mostly-missing ones from the training data  
+test.data %>% 
+    select(any_of(names(train.data.clean)))
+```
+
+Since only variables present in the final model are used for prediction, I'm not going to subset the testing data - the extra variables will simply be ignored.  
+
+
+### Exploratory data analysis and preprocessing of the training data    
+
+```{r check_predictors_summary}
+## check the summary of all predictors  
+summary(train.data.clean)
+```
+
+All remaining predictors are numeric, measured on different scales, so they will need to be centered and scaled first. There are no NAs. Some seem to have outliers, e.g. gyros_dumbbell_x, magnet_dumbbell_y.  
+
+```{r check_predictors_outliers}
+outliers::outlier(train.data.clean %>% select_if(is.numeric))
+```
+
+I don't know enough about these measurements to say if the extreme values are an error or just extreme for some reason, so I won't change them; instead, I'll choose a model type that is more or less robust to outliers (and consider possibly transforming the data).  
+
+There aren't any zero- or near-zero variance variables left in this reduced dataset.  
+```{r check_near_zero_variance_predictors}
+## check for variables with near-zero variance.  
+## this will also include the id (X1), but I don't care
+nearZeroVar(train.data.clean %>% select_if(is.numeric), 
+            saveMetrics=TRUE)
+```
+
+ 
+Correlations between predictors were calculated to determine highly correlated variables to be dropped (at a cutoff = 0.9).  
+This will remove most belt sensor measurements, but they probably should go - their correlations are 1 or very close to it.  
+```{r check_cor_variables}
+## calculate correlations between predictors
+pred.cor <- train.data.clean %>% 
+    select(-c(X1, user_name, classe)) %>% 
+    cor()
+
+## check which predictors will be removed by caret's findCorrelation function at cutoff = 0.85, and visualize the correlations 
+train.data.clean %>% 
+    select(-c(X1, user_name, classe)) %>% 
+    select(findCorrelation(pred.cor, cutoff = 0.9)) %>% 
+    cor %>% 
+    corrplot::corrplot()
+```
+
+
+There aren't any linear dependencies between the remaining predictors.   
+```{r check_linear_dependencies}
+train.data.clean %>% 
+    select(-c(X1, user_name, classe)) %>% 
+    findLinearCombos()
+```
+
+
+PCA was applied on the predictors to possibly try to reduce their number and see if a weighted combination of predictors might be better.  
+```{r pca_predictors}
+## perform PCA on the predictors
+pred.pca <- prcomp(train.data.clean %>% select(-c(X1, user_name, classe)), center = TRUE, scale. = TRUE)
+
+## plot the PCA
+library(ggfortify)
+autoplot(pred.pca, data = train.data.clean, colour = "classe", 
+         loadings = TRUE, loadings.label = TRUE, loadings.label.size = 3)
+```
+
+The exercise classes are not really very well separated, and most predictors don't seem to "pull" in the same direction (some don't appear to have much influence at all). Also, the first two PCs only capture ~30% of the variance of the dataset.  
+Interestingly, there **are** clusters of observations on the biplot - these are probably the different subjects performing the exercises.  
+
+I'm still going to use PCA as a preprocessing step, because the number of predictors is very high, which will increase computation time. The downsides are that it's very likely that many PCs will have to be retained to capture a sufficient proportion of the variability, and the interpretation of the final model won't be very straightforward. But since the primary objective is the prediction accuracy, I think it's justified.      
+
+
+### Model selection and training   
+I'm going to use a random forests model, as the goal is to accurately classify the activity type. These are flexible models that can handle non-linearity in the data, and are suited for multiclass classification problems. They should perform well given the size of the dataset, have "built-in" feature selection, and should take a moderate amount of time to fit on my computer. In addition, decision trees are relatively insensitive to outliers, which are present in this dataset.   
+
+Before fitting the model, preprocessing of the training data was performed using package caret. Highly correlated predictors (> 0.9) were removed, the remaining predictors were scaled and centered, and the number of predictors was reduced using PCA, making sure to capture 85% of the total variance in the dataset.    
+```{r preprocess_train}
+preprocess.method <- preProcess(train.data.clean %>% select(-c(X1, user_name, classe)), 
+                                method = c("corr", "center", "scale", "pca"),
+                                ## proportion of variance captured by PCA
+                                thresh = 0.85,
+                                ## correlation coefficient cutoff
+                                cutoff = 0.9)
+
+## check what will be done to which variable(s)
+preprocess.method$method
+
+## preprocess the training data
+train.prepr <- predict(preprocess.method, 
+                       train.data.clean %>% select(-c(X1, user_name, classe)))  
+```
+
+
+None of the final set of predictors (15 PCs) seem to separate the exercise  classes well on their own - some combination of them is likely to be needed.    
+```{r visualize_final_preprocessed_pred}
+featurePlot(x = train.prepr, 
+            y = train.data.clean %>% pull(classe), 
+            plot = "box",
+            strip=strip.custom(par.strip.text = list(cex = 0.7)),
+            scales = list(x = list(relation = "free"),
+                          y = list(relation = "free"))
+            )
+```
+
+
+A random forest model was fitted to the preprocessed training dataset, using the implementation in package ranger, which is fast and has built-in support for parallel processing. When fitted through caret, automatic model tuning is applied for the mtry parameter, with final selection of the value resulting in the lowest classification error rate. The default number of trees (500) was used.    
+
+K-fold cross-validation was used to get a more accurate estimate of the out of sample error (rather than just using the out-of-bag error calculated by the random forest algorithm, which is often too optimistic), with k = 10, which usually gives moderate bias and variance, and 3 repeats so as not to introduce bias through excessive repetition, and to get a moderate computation time.  
+```{r define_cv_control}
+mod.cv.ctrl <- trainControl(method = "repeatedcv",
+                            number = 10, repeats = 3,  
+                            allowParallel = TRUE 
+                            )
+```
+
+
+```{r fit_rf_train, cache=TRUE}
+## train random forest model
+set.seed(222)
+mod.rf <- train(x = train.prepr,
+                y = train.data.clean %>% pull(classe),
+                method = "ranger", 
+                trControl = mod.cv.ctrl,
+                importance = "impurity", 
+                num.threads = 6, verbose = FALSE 
+                )
+
+
+## save the random forest model in an R object for safekeeping   
+write_rds(mod.rf, 
+          here(save.dir, "model_rf.rds"))
+```
+
+
+```{r check_rf_tuning}
+mod.rf
+```
+
+The final model has `r round(mod.rf$results[rownames(mod.rf$bestTune), "Accuracy"] * 100, digits = 2)` % accuracy on the training dataset, and an out-of-bag prediction error of `r round(mod.rf$finalModel$prediction.error * 100, digits = 2)` %.  
+```{r summary_final_model_rf}
+mod.rf$finalModel
+```
+
+The estimated out-of-sample error according to the cross-validation is `r round( (1 - mod.rf$results[rownames(mod.rf$bestTune), "Accuracy"]) * 100, digits = 2)` % (or 1 - the accuracy).   
+```{r confusin_matrix_rf_train}
+confusionMatrix.train(mod.rf)
+```
+
+### Prediction on test dataset   
+The final model was used to predict the exercise class on the test dataset, after preprocessing it in the same way as the training dataset.   
+The predictions will be submitted to the quiz part of the course project for automatic grading.    
+```{r predict_rf_test}
+## preprocess test dataset in the same way as the training 
+test.prepr <- predict(preprocess.method, test.data)
+
+## predict on test dataset 
+(test.pred <- predict(mod.rf, test.prepr))
+```
+
+
+### Appendix: R code  
+
+```{r code_appendix, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
